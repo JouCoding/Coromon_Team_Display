@@ -80,7 +80,6 @@ const parseAvatarFilename = (filename) => {
     potency = POTENCY_CODE_MAP[parts[pIdx]];
   }
 
-  // Filter out species, potency words, and A/B/C codes from skin identification
   const skinParts = parts.filter((p, i) => i !== 0 && !POTENCY_CODE_MAP[p]);
   let skin = 'Standard';
   if (skinParts.length > 0) {
@@ -105,29 +104,22 @@ const getAvatarUrl = (member, avatarFiles) => {
 
   const isStandard = rawSkin === 'standard';
 
-  // 1. Try Specific Skin Matches first to avoid falling back to standard species avatar
   if (!isStandard) {
     for (const skin of skinsToTry) {
       let match = null;
-      // Pattern: species_potency_skin
       if (potencyWord) match = check(`${species}_${potencyWord}_${skin}`);
       if (!match) match = check(`${species}_${potencyCode}_${skin}`);
-      // Pattern: species_skin (which is usually A potency)
       if (!match) match = check(`${species}_${skin}`);
-      
       if (match) return `${AVATAR_BASE}${match}`;
     }
   }
 
-  // 2. Try Standard/Potency Matches as fallback or if skin is Standard
   let match = null;
   if (potencyWord) match = check(`${species}_${potencyWord}`);
   if (!match) match = check(`${species}_${potencyCode}`);
   if (!match) match = check(species);
   
   if (match) return `${AVATAR_BASE}${match}`;
-
-  // 3. Absolute last resort fuzzy
   const fuzzy = avatarFiles.find(f => f.toLowerCase().startsWith(species));
   return fuzzy ? `${AVATAR_BASE}${fuzzy}` : null;
 };
@@ -148,7 +140,7 @@ const getSpriteUrl = (member, manifest) => {
 
 // --- PREVIEW RENDERER ---
 
-const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale = 1, centered = true }) => {
+const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale = 1, forceAnchor = true }) => {
   const activeMembers = team.filter(m => m.isActive && m.coromonName);
   const gridTemplateColumns = useMemo(() => {
     if (layout === 'grid-2x3') return 'repeat(2, max-content)';
@@ -168,7 +160,6 @@ const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale
   const getContainerStyles = () => {
     const isGrid = layout.includes('grid');
     const isStack = layout === 'stack';
-    const isRow = layout === 'row';
     let styles = {
       display: isGrid ? 'grid' : 'flex',
       flexDirection: isStack ? 'column' : 'row',
@@ -176,26 +167,25 @@ const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale
       gap: isGrid ? `${scaledSpacingY}px ${scaledSpacingX}px` : (isStack ? `${scaledSpacingY}px` : `${scaledSpacingX}px`),
       width: 'max-content',
       height: 'max-content',
-      transition: 'gap 0.2s ease-out'
+      transition: 'gap 0.2s ease-out',
+      // Team centering should be with 1st member, not middle
+      justifyContent: 'flex-start',
+      alignItems: 'flex-start'
     };
-    if (centered) {
-      styles.justifyContent = 'center';
-      styles.alignItems = 'center';
-      if (isGrid) { styles.justifyItems = 'center'; styles.alignContent = 'center'; }
-    } else {
-      if (isRow) { styles.justifyContent = 'start'; styles.alignItems = 'center'; }
-      else { styles.justifyContent = 'start'; styles.alignItems = 'center'; if (isGrid) { styles.justifyItems = 'center'; styles.alignContent = 'start'; } }
-    }
     return styles;
   };
 
+  // Improved Glow Logic for OBS parity
   const glowValue = settings.glowIntensity || 0;
-  const glowStyle = glowValue > 0 ? `drop-shadow(0 0 ${glowValue / 2}px rgba(255,255,255,${glowValue / 100}))` : 'none';
+  const glowStyle = glowValue > 0 
+    ? `drop-shadow(0 0 ${glowValue / 5}px rgba(255,255,255,${glowValue / 100})) drop-shadow(0 0 ${glowValue / 10}px rgba(255,255,255,0.8))` 
+    : 'none';
+    
   const namePos = settings.namePosition || 'below';
 
   return (
     <div style={getContainerStyles()}>
-      {activeMembers.map((member, i) => {
+      {activeMembers.map((member) => {
         const imageUrl = viewMode === 'sprites' 
           ? getSpriteUrl(member, manifest)
           : getAvatarUrl(member, manifestAvatars);
@@ -316,7 +306,7 @@ const ObsView = ({ manifest, manifestAvatars }) => {
   }
 
   return (
-    <div className="fixed inset-0 overflow-hidden flex items-center justify-center">
+    <div className="fixed inset-0 overflow-hidden flex items-start justify-start p-10">
       <TeamRenderer 
         team={syncedData.team} 
         settings={syncedData.settings} 
@@ -324,7 +314,6 @@ const ObsView = ({ manifest, manifestAvatars }) => {
         manifest={manifest} 
         manifestAvatars={manifestAvatars}
         scale={1}
-        centered={true}
       />
     </div>
   );
@@ -568,12 +557,11 @@ const App = () => {
       .catch(() => {});
   }, []);
 
-  const getLayoutLink = (layout, isStatic = false) => {
+  const getLayoutLink = (layout) => {
     const base = window.location.href.split('#')[0].split('?')[0];
     const u = userName || 'unnamed';
-    let url = `${base}#/obs?u=${u}&l=${layout}`;
-    if (isStatic) { url += `&d=${btoa(JSON.stringify({ team, settings }))}`; }
-    return url;
+    // Single consolidated link that leverages the active sync channel
+    return `${base}#/obs?u=${u}&l=${layout}`;
   };
 
   const updateSlot = (idx, up) => {
@@ -693,11 +681,6 @@ const App = () => {
                   >
                     {manualSuccess ? <><Check size={16} /> Changes Synced!</> : <><Send size={16} /> Apply Changes Manually</>}
                   </button>
-                  <div className="p-6 bg-amber-500/10 border border-amber-500/20 rounded-[2.5rem]">
-                    <p className="text-[10px] text-amber-500/90 leading-relaxed font-bold uppercase italic text-center">
-                      If images aren't loading, check if your Coromon name matches exactly!
-                    </p>
-                  </div>
                 </div>
 
                 <div className="space-y-6">
@@ -743,14 +726,12 @@ const App = () => {
                         <span className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-500 group-hover:text-blue-400 transition-colors">
                           {l.replace('-', ' ')}
                         </span>
-                        <div className="flex gap-2">
-                           <button onClick={() => { navigator.clipboard.writeText(getLayoutLink(l)); alert(`Live Link Copied!`); }} className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-gray-800 hover:bg-blue-600 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">
-                             <Wifi size={12} /> Live
-                           </button>
-                           <button onClick={() => { navigator.clipboard.writeText(getLayoutLink(l, true)); alert(`Static Link Copied!`); }} className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-gray-800 hover:bg-emerald-600 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">
-                             <Database size={12} /> Static
-                           </button>
-                        </div>
+                        <button 
+                          onClick={() => { navigator.clipboard.writeText(getLayoutLink(l)); alert(`Overlay Link Copied!`); }} 
+                          className="w-full flex items-center justify-center gap-2 py-3 bg-gray-800 hover:bg-blue-600 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
+                        >
+                          <Wifi size={14} /> Copy OBS Overlay Link
+                        </button>
                       </div>
                     ))}
                   </div>
@@ -839,7 +820,7 @@ const App = () => {
                 <div className="min-h-[600px] border-t border-gray-800/60 bg-[#020617] relative group overflow-hidden flex flex-col">
                   <div className="absolute top-6 left-6 z-10 flex items-center gap-4">
                     <div className="bg-black/80 backdrop-blur-xl border border-white/10 px-4 py-2 rounded-2xl flex items-center gap-3 shadow-2xl text-[10px] font-black uppercase tracking-widest text-white">
-                      <Eye size={14} className="text-blue-500" /> Preview
+                      <Eye size={14} className="text-blue-500" /> Live Preview
                     </div>
                     <div className="flex gap-2 p-1 bg-black/60 backdrop-blur-md rounded-xl border border-white/5 shadow-2xl">
                       {['row', 'stack', 'grid-2x3', 'grid-3x2'].map(l => (
@@ -849,16 +830,16 @@ const App = () => {
                       ))}
                     </div>
                   </div>
-                  <div className={`flex-1 w-full overflow-auto custom-scrollbar p-12 flex flex-col ${previewLayout === 'row' ? 'items-start justify-center' : 'items-center justify-start'}`}>
-                    <div className="min-h-min min-w-min">
+                  <div className={`flex-1 w-full overflow-auto custom-scrollbar p-12 flex flex-col items-start justify-start`}>
+                    <div className="min-h-min min-w-min bg-blue-500/5 p-8 rounded-[3rem] border border-blue-500/10">
                       <TeamRenderer 
                         team={team} 
                         settings={settings} 
                         layout={previewLayout} 
                         manifest={manifest} 
                         manifestAvatars={manifestAvatars}
-                        scale={previewLayout === 'stack' || previewLayout.includes('grid') ? 0.525 : 0.675} 
-                        centered={false} 
+                        scale={0.65} 
+                        forceAnchor={true}
                       />
                     </div>
                   </div>
