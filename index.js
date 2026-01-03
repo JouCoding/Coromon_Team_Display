@@ -16,8 +16,9 @@ const AVATAR_BASE = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME
 const GITHUB_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_PATH}`;
 const AVATAR_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${AVATAR_PATH}`;
 
-// Local sync channel prefix
-const SYNC_PREFIX = 'coromon_sync_v7_';
+// Remote Sync Config (ntfy.sh is a free, public, no-auth-needed pub/sub service)
+const NTFY_BASE = 'https://ntfy.sh';
+const SYNC_PREFIX = 'coromon_sync_v8_';
 
 // Skin Mapping
 const SKIN_MAP = { 'd': 'Blue', 'darkmagic': 'Crimsonite' };
@@ -139,8 +140,8 @@ const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale
         flexDirection: layout === 'stack' ? 'column' : 'row',
         gridTemplateColumns,
         gap: layout.includes('grid') ? `${sy}px ${sx}px` : (layout === 'stack' ? `${sy}px` : `${sx}px`),
-        justifyContent: 'flex-start',
-        alignItems: 'flex-start',
+        justifyContent: 'flex-start', // 1st slot anchor
+        alignItems: 'flex-start', // 1st slot anchor
         width: 'max-content',
         height: 'max-content'
       }}
@@ -183,7 +184,8 @@ const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale
 const ObsView = ({ manifest, manifestAvatars }) => {
   const { search } = useLocation();
   const params = new URLSearchParams(search);
-  const u = params.get('u')?.toLowerCase() || 'unnamed';
+  const rawU = params.get('u') || 'unnamed';
+  const u = rawU.toLowerCase().trim(); // Ensure consistency
   const l = params.get('l') || 'row';
   const d = params.get('d');
   
@@ -192,27 +194,54 @@ const ObsView = ({ manifest, manifestAvatars }) => {
     return null;
   });
 
+  const lastTsRef = useRef(data?.ts || 0);
+
   useEffect(() => {
-    const channel = new BroadcastChannel(`${SYNC_PREFIX}${u}`);
-    channel.onmessage = (e) => {
+    // 1. Local Sync (Same Browser)
+    const localChannel = new BroadcastChannel(`${SYNC_PREFIX}${u}`);
+    localChannel.onmessage = (e) => {
       const { team, settings, ts } = e.data;
-      setData(prev => (!prev || ts > (prev.ts || 0)) ? { team, settings, ts } : prev);
+      if (ts > lastTsRef.current) {
+        lastTsRef.current = ts;
+        setData({ team, settings, ts });
+      }
     };
-    return () => channel.close();
+
+    // 2. Remote Sync (Across Browsers/OBS)
+    // We use EventSource for ultra-low latency listening to ntfy.sh
+    const remoteUrl = `${NTFY_BASE}/${SYNC_PREFIX}${u}/sse`;
+    const eventSource = new EventSource(remoteUrl);
+    
+    eventSource.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.message) {
+          const remoteData = JSON.parse(payload.message);
+          if (remoteData.ts > lastTsRef.current) {
+            lastTsRef.current = remoteData.ts;
+            setData(remoteData);
+          }
+        }
+      } catch(err) {}
+    };
+
+    return () => {
+      localChannel.close();
+      eventSource.close();
+    };
   }, [u]);
 
   if (!data) return (
-    <div className="fixed inset-0 flex flex-col items-center justify-center gap-4">
+    <div className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-transparent">
       <div className="w-16 h-16 rounded-full border-4 border-blue-600/20 border-t-blue-500 animate-spin" />
       <div className="text-center">
-        <h1 className="text-white font-pixel text-[10px] uppercase animate-pulse">Waiting for Dashboard...</h1>
-        <p className="text-blue-500/50 font-pixel text-[8px] uppercase tracking-widest mt-2">Channel: {u}</p>
+        <h1 className="text-white font-pixel text-[10px] uppercase animate-pulse">Initializing...</h1>
       </div>
     </div>
   );
 
   return (
-    <div className="fixed inset-0 flex items-start justify-start p-10 overflow-hidden">
+    <div className="fixed inset-0 flex items-start justify-start p-10 overflow-hidden bg-transparent">
       <TeamRenderer team={data.team} settings={data.settings} layout={l} manifest={manifest} manifestAvatars={manifestAvatars} scale={1} />
     </div>
   );
@@ -336,11 +365,35 @@ const App = () => {
   const [manifest, setManifest] = useState(null);
   const [manifestAvatars, setManifestAvatars] = useState([]);
   const [previewLayout, setPreviewLayout] = useState('row');
-  const syncChannelRef = useRef(null);
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle, syncing, error
+
+  const localChannelRef = useRef(null);
 
   useEffect(() => {
-    syncChannelRef.current = new BroadcastChannel(`${SYNC_PREFIX}${user}`);
-    return () => syncChannelRef.current?.close();
+    const u = user.toLowerCase().trim();
+    localChannelRef.current = new BroadcastChannel(`${SYNC_PREFIX}${u}`);
+    return () => localChannelRef.current?.close();
+  }, [user]);
+
+  // Unified Broadcast Function
+  const broadcast = useCallback(async (payload) => {
+    const u = user.toLowerCase().trim();
+    const data = { ...payload, ts: Date.now() };
+
+    // 1. Local (same browser tabs)
+    localChannelRef.current?.postMessage(data);
+
+    // 2. Remote (OBS / other browsers)
+    setSyncStatus('syncing');
+    try {
+      await fetch(`${NTFY_BASE}/${SYNC_PREFIX}${u}`, {
+        method: 'POST',
+        body: JSON.stringify(data)
+      });
+      setSyncStatus('idle');
+    } catch(err) {
+      setSyncStatus('error');
+    }
   }, [user]);
 
   useEffect(() => {
@@ -348,8 +401,8 @@ const App = () => {
     safeStorage.set('coromon-active-profile', activeProfileId);
     safeStorage.set('coromon-settings-v2', JSON.stringify(settings));
     safeStorage.set('coromon-username', user);
-    syncChannelRef.current?.postMessage({ team, settings, ts: Date.now() });
-  }, [profiles, activeProfileId, settings, user, team]);
+    broadcast({ team, settings });
+  }, [profiles, activeProfileId, settings, user, team, broadcast]);
 
   useEffect(() => { 
     fetch(GITHUB_API).then(r => r.json()).then(d => Array.isArray(d) && setManifest(d.filter(i => i.name.endsWith('.gif')).map(i => parseSpriteFilename(i.name))));
@@ -358,8 +411,9 @@ const App = () => {
 
   const getLink = (l) => {
     const base = window.location.href.split('#')[0].split('?')[0];
+    const u = user.toLowerCase().trim();
     const data = btoa(JSON.stringify({ team, settings, ts: Date.now() }));
-    return `${base}#/obs?u=${user}&l=${l}&d=${data}`;
+    return `${base}#/obs?u=${u}&l=${l}&d=${data}`;
   };
 
   const updateSlot = (idx, up) => {
@@ -386,15 +440,21 @@ const App = () => {
                 <div className="w-12 h-12 rounded-2xl bg-blue-600 flex items-center justify-center" style={{ transform: 'rotate(-5deg)' }}><Zap size={26} className="text-white fill-current" /></div>
                 <h1 className="text-base font-black uppercase tracking-[0.4em] text-white italic">Coromon Team Display</h1>
               </div>
-              <div className="flex items-center gap-3 bg-gray-900 border border-gray-800 px-5 py-2.5 rounded-2xl focus-within:border-blue-500">
-                <User size={16} className="text-gray-500" />
-                <input type="text" value={user} onChange={e => setUser(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-black uppercase tracking-widest w-40 text-white placeholder-gray-700" />
-                <button onClick={() => setUser('trainer-' + Math.random().toString(36).substring(7))} className="p-1.5 hover:bg-white/5 rounded-lg text-gray-600 hover:text-blue-500"><RefreshCcw size={12} /></button>
+              <div className="flex items-center gap-6">
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${syncStatus === 'syncing' ? 'bg-blue-500 animate-pulse' : syncStatus === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`} />
+                  <span className="text-[9px] font-black uppercase tracking-widest text-gray-500">{syncStatus === 'syncing' ? 'Syncing OBS...' : syncStatus === 'error' ? 'Sync Error' : 'OBS Synced'}</span>
+                </div>
+                <div className="flex items-center gap-3 bg-gray-900 border border-gray-800 px-5 py-2.5 rounded-2xl focus-within:border-blue-500">
+                  <User size={16} className="text-gray-500" />
+                  <input type="text" value={user} onChange={e => setUser(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-black uppercase tracking-widest w-40 text-white placeholder-gray-700" />
+                  <button onClick={() => setUser('trainer-' + Math.random().toString(36).substring(7))} className="p-1.5 hover:bg-white/5 rounded-lg text-gray-600 hover:text-blue-500"><RefreshCcw size={12} /></button>
+                </div>
               </div>
             </nav>
             <div className="flex-1 flex overflow-hidden">
               <aside className="w-[30rem] bg-gray-950/50 border-r border-gray-800/40 p-8 flex flex-col gap-10 overflow-y-auto custom-scrollbar">
-                <div className="p-6 bg-blue-500/10 border border-blue-500/20 rounded-[2.5rem]"><p className="text-[10px] text-blue-400 font-bold uppercase italic text-center leading-relaxed">Dashboard & OBS sync instantly on the same PC!</p></div>
+                <div className="p-6 bg-blue-500/10 border border-blue-500/20 rounded-[2.5rem]"><p className="text-[10px] text-blue-400 font-bold uppercase italic text-center leading-relaxed">Changes sync to OBS instantly via Background Cloud Sync!</p></div>
                 <div className="space-y-6">
                   <h2 className="text-[11px] font-black uppercase text-gray-500 tracking-widest flex items-center gap-3"><User size={14} className="text-blue-500" /> Profiles</h2>
                   <div className="bg-gray-900/40 border border-gray-800 rounded-[2.5rem] p-6 space-y-6">
@@ -406,13 +466,13 @@ const App = () => {
                   </div>
                 </div>
                 <div className="space-y-6">
-                  <h2 className="text-[11px] font-black uppercase text-gray-500 tracking-widest flex items-center gap-3"><LinkIcon size={14} className="text-blue-500" /> Overlay Links</h2>
+                  <h2 className="text-[11px] font-black uppercase text-gray-500 tracking-widest flex items-center gap-3"><LinkIcon size={14} className="text-blue-500" /> Smart Overlay Links</h2>
                   <div className="grid grid-cols-1 gap-4">
                     {['row', 'stack', 'grid-2x3', 'grid-3x2'].map(l => (
                       <div key={l} className="p-5 bg-gray-900/40 border border-gray-800 rounded-[2.5rem] hover:border-blue-500/30 transition-all flex flex-col gap-3">
                         <span className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-500">{l.replace('-', ' ')}</span>
                         <div className="flex gap-2">
-                          <button onClick={() => { navigator.clipboard.writeText(getLink(l)); alert('Copied!'); }} className="flex-1 flex items-center justify-center gap-2 py-3 bg-gray-800 hover:bg-emerald-600 rounded-xl text-[9px] font-black uppercase whitespace-nowrap"><Database size={14} /> Copy Link</button>
+                          <button onClick={() => { navigator.clipboard.writeText(getLink(l)); alert('Copied Smart Link!'); }} className="flex-1 flex items-center justify-center gap-2 py-3 bg-gray-800 hover:bg-emerald-600 rounded-xl text-[9px] font-black uppercase whitespace-nowrap"><Database size={14} /> Copy Smart Link</button>
                           <button onClick={() => window.open(getLink(l), '_blank')} className="px-4 flex items-center justify-center bg-gray-800 hover:bg-blue-600 rounded-xl text-white transition-all" title="Open in New Tab"><ExternalLink size={14} /></button>
                         </div>
                       </div>
