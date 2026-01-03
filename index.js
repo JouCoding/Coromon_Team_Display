@@ -7,8 +7,6 @@ import {
   GripVertical, Layout
 } from 'https://esm.sh/lucide-react@0.474.0?deps=react@19.0.0';
 
-
-const SIGNAL_BASE = 'https://ntfy.sh';
 const PROTOCOL_VERSION = 'v6';
 const REPO_OWNER = 'JouCoding';
 const REPO_NAME = 'Coromon_Sprites-Skins';
@@ -19,8 +17,6 @@ const AVATAR_BASE = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME
 const GITHUB_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${REPO_PATH}`;
 const AVATAR_API = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${AVATAR_PATH}`;
 
-const CLOUD_SYNC_DEBOUNCE_MS = 3000; 
-const PENALTY_COOLDOWN_MS = 300000; 
 const LOCAL_CHANNEL_NAME = 'coromon_hub_broadcast';
 
 // Skin Mapping for better UX
@@ -104,22 +100,29 @@ const getAvatarUrl = (member, avatarFiles) => {
 
   const isStandard = rawSkin === 'standard';
 
+  // 1. Try Specific Skin Matches first to avoid falling back to standard species avatar
   if (!isStandard) {
     for (const skin of skinsToTry) {
       let match = null;
+      // Pattern: species_potency_skin
       if (potencyWord) match = check(`${species}_${potencyWord}_${skin}`);
       if (!match) match = check(`${species}_${potencyCode}_${skin}`);
+      // Pattern: species_skin (which is usually A potency for that skin)
       if (!match) match = check(`${species}_${skin}`);
+      
       if (match) return `${AVATAR_BASE}${match}`;
     }
   }
 
+  // 2. Try Standard/Potency Matches as fallback or if skin is Standard
   let match = null;
   if (potencyWord) match = check(`${species}_${potencyWord}`);
   if (!match) match = check(`${species}_${potencyCode}`);
   if (!match) match = check(species);
   
   if (match) return `${AVATAR_BASE}${match}`;
+
+  // 3. Last resort fuzzy
   const fuzzy = avatarFiles.find(f => f.toLowerCase().startsWith(species));
   return fuzzy ? `${AVATAR_BASE}${fuzzy}` : null;
 };
@@ -140,7 +143,7 @@ const getSpriteUrl = (member, manifest) => {
 
 // --- PREVIEW RENDERER ---
 
-const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale = 1, forceAnchor = true }) => {
+const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale = 1 }) => {
   const activeMembers = team.filter(m => m.isActive && m.coromonName);
   const gridTemplateColumns = useMemo(() => {
     if (layout === 'grid-2x3') return 'repeat(2, max-content)';
@@ -168,14 +171,13 @@ const TeamRenderer = ({ team, settings, layout, manifest, manifestAvatars, scale
       width: 'max-content',
       height: 'max-content',
       transition: 'gap 0.2s ease-out',
-      // Team centering should be with 1st member, not middle
       justifyContent: 'flex-start',
       alignItems: 'flex-start'
     };
     return styles;
   };
 
-  // Improved Glow Logic for OBS parity
+  // Improved Glow Logic for OBS parity - layered drop shadows make it pop
   const glowValue = settings.glowIntensity || 0;
   const glowStyle = glowValue > 0 
     ? `drop-shadow(0 0 ${glowValue / 5}px rgba(255,255,255,${glowValue / 100})) drop-shadow(0 0 ${glowValue / 10}px rgba(255,255,255,0.8))` 
@@ -258,39 +260,7 @@ const ObsView = ({ manifest, manifestAvatars }) => {
             setSyncedData({ team, settings });
         }
     };
-    const topic = `coromon_hub_${PROTOCOL_VERSION}_${user}`;
-    const loadHistory = async () => {
-      try {
-        const res = await fetch(`${SIGNAL_BASE}/${topic}/json?since=all`);
-        const text = await res.text();
-        const lines = text.trim().split('\n').filter(Boolean);
-        if (lines.length > 0) {
-          for (let i = lines.length - 1; i >= 0; i--) {
-            const m = JSON.parse(lines[i]);
-            if (m.message) {
-              const payload = JSON.parse(m.message);
-              if (payload.ts > lastTsRef.current) {
-                lastTsRef.current = payload.ts;
-                setSyncedData(payload);
-                break;
-              }
-            }
-          }
-        }
-      } catch (e) {}
-    };
-    loadHistory();
-    const eventSource = new EventSource(`${SIGNAL_BASE}/${topic}/sse`);
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.message) {
-          const payload = JSON.parse(data.message);
-          if (payload.ts > lastTsRef.current) { lastTsRef.current = payload.ts; setSyncedData(payload); }
-        }
-      } catch (e) {}
-    };
-    return () => { eventSource.close(); localChannel.close(); };
+    return () => { localChannel.close(); };
   }, [user]);
 
   if (!syncedData) {
@@ -298,7 +268,7 @@ const ObsView = ({ manifest, manifestAvatars }) => {
           <div className="fixed inset-0 bg-transparent flex flex-col items-center justify-center gap-4">
               <div className="w-16 h-16 rounded-full border-4 border-blue-600/20 border-t-blue-500 animate-spin" />
               <div className="text-center space-y-2">
-                  <h1 className="text-white font-pixel text-[10px] uppercase animate-pulse">Waiting for Team Display...</h1>
+                  <h1 className="text-white font-pixel text-[10px] uppercase animate-pulse">Waiting for Team Data...</h1>
                   <p className="text-blue-500/50 font-pixel text-[8px] uppercase tracking-widest">Channel: {user}</p>
               </div>
           </div>
@@ -481,39 +451,15 @@ const App = () => {
 
   const [manifest, setManifest] = useState(null);
   const [manifestAvatars, setManifestAvatars] = useState([]);
-  const [syncStatus, setSyncStatus] = useState('idle'); 
-  const [manualSuccess, setManualSuccess] = useState(false);
   const [previewLayout, setPreviewLayout] = useState('row');
   
-  const lastSyncedDataRef = useRef('');
-  const cooldownEndRef = useRef(0);
   const localChannelRef = useRef(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => { localChannelRef.current = new BroadcastChannel(LOCAL_CHANNEL_NAME); return () => localChannelRef.current?.close(); }, []);
 
-  const pushToCloud = useCallback(async (manual = false) => {
-    if (!userName || userName.length < 2) return;
+  const broadcastChanges = useCallback(() => {
     localChannelRef.current?.postMessage({ team, settings, user: userName, ts: Date.now() });
-    
-    if (manual) {
-      setManualSuccess(true);
-      setTimeout(() => setManualSuccess(false), 2000);
-    }
-
-    if (!manual && !settings.liveSync) return;
-    const currentPayload = JSON.stringify({ team, settings: { ...settings, liveSync: undefined } });
-    if (currentPayload === lastSyncedDataRef.current && !manual) { setSyncStatus('synced'); return; }
-    if (Date.now() < cooldownEndRef.current && !manual) { setSyncStatus('cooldown'); return; }
-    setSyncStatus('syncing');
-    try {
-      const topic = `coromon_hub_${PROTOCOL_VERSION}_${userName.toLowerCase()}`;
-      const response = await fetch(`${SIGNAL_BASE}/${topic}`, { method: 'POST', body: JSON.stringify({ team, settings, ts: Date.now() }), mode: 'cors' });
-      if (response.status === 429) { setSyncStatus('cooldown'); cooldownEndRef.current = Date.now() + PENALTY_COOLDOWN_MS; return; }
-      if (!response.ok) throw new Error();
-      setSyncStatus('synced');
-      lastSyncedDataRef.current = currentPayload;
-    } catch (e) { setSyncStatus('error'); }
   }, [team, settings, userName]);
 
   useEffect(() => {
@@ -521,12 +467,8 @@ const App = () => {
     safeStorage.set('coromon-active-profile', activeProfileId);
     safeStorage.set('coromon-settings-v2', JSON.stringify(settings));
     safeStorage.set('coromon-username', userName);
-
-    const currentPayload = JSON.stringify({ team, settings: { ...settings, liveSync: undefined } });
-    if (currentPayload !== lastSyncedDataRef.current) { setSyncStatus('dirty'); }
-    const timer = setTimeout(() => pushToCloud(false), CLOUD_SYNC_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [profiles, activeProfileId, settings, userName, pushToCloud]);
+    broadcastChanges();
+  }, [profiles, activeProfileId, settings, userName, broadcastChanges]);
 
   useEffect(() => { 
     fetch(GITHUB_API)
@@ -548,10 +490,6 @@ const App = () => {
         if (Array.isArray(data)) {
           const avatars = data.filter(i => i.name.endsWith('.png')).map(i => i.name);
           setManifestAvatars(avatars);
-          avatars.slice(0, 100).forEach(f => {
-            const img = new Image();
-            img.src = `${AVATAR_BASE}${f}`;
-          });
         }
       })
       .catch(() => {});
@@ -560,8 +498,8 @@ const App = () => {
   const getLayoutLink = (layout) => {
     const base = window.location.href.split('#')[0].split('?')[0];
     const u = userName || 'unnamed';
-    // Single consolidated link that leverages the active sync channel
-    return `${base}#/obs?u=${u}&l=${layout}`;
+    const data = btoa(JSON.stringify({ team, settings }));
+    return `${base}#/obs?u=${u}&l=${layout}&d=${data}`;
   };
 
   const updateSlot = (idx, up) => {
@@ -583,14 +521,11 @@ const App = () => {
     e.dataTransfer.effectAllowed = "move";
   };
 
-  const handleDragOver = (e) => {
-    e.preventDefault();
-  };
+  const handleDragOver = (e) => { e.preventDefault(); };
 
   const handleDrop = (e, index) => {
     e.preventDefault();
     if (draggedIdx === null || draggedIdx === index) return;
-
     const newProfiles = profiles.map(p => {
       if (p.id !== activeProfileId) return p;
       const newTeam = [...p.team];
@@ -661,9 +596,9 @@ const App = () => {
                 </div>
               </div>
               <div className="flex items-center gap-4">
-                <div className={`flex items-center gap-3 bg-gray-900 border px-5 py-2.5 rounded-2xl transition-all ${syncStatus === 'error' ? 'border-red-500/50' : syncStatus === 'cooldown' ? 'border-amber-500/50 animate-pulse' : 'border-gray-800 focus-within:border-blue-500'}`}>
+                <div className={`flex items-center gap-3 bg-gray-900 border px-5 py-2.5 rounded-2xl transition-all border-gray-800 focus-within:border-blue-500`}>
                   <User size={16} className="text-gray-500" />
-                  <input type="text" placeholder="Set Nickname..." value={userName} onChange={e => setUserName(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-black uppercase tracking-widest w-40 text-white placeholder-gray-700" />
+                  <input type="text" placeholder="Trainer Nickname..." value={userName} onChange={e => setUserName(e.target.value)} className="bg-transparent border-none outline-none text-[11px] font-black uppercase tracking-widest w-40 text-white placeholder-gray-700" />
                   <button onClick={() => setUserName('trainer-' + Math.random().toString(36).substring(7))} className="p-1.5 hover:bg-white/5 rounded-lg transition-colors text-gray-600 hover:text-blue-500" title="Rotate Channel">
                     <RefreshCcw size={12} />
                   </button>
@@ -673,14 +608,10 @@ const App = () => {
 
             <div className="flex-1 flex overflow-hidden">
               <aside className="w-[30rem] bg-gray-950/50 border-r border-gray-800/40 p-8 flex flex-col gap-10 overflow-y-auto custom-scrollbar">
-                
-                <div className="space-y-4">
-                  <button 
-                    onClick={() => pushToCloud(true)} 
-                    className={`w-full flex items-center justify-center gap-3 py-4 rounded-[2rem] text-[11px] font-black uppercase tracking-widest transition-all shadow-xl active:scale-[0.98] ${manualSuccess ? 'bg-emerald-600 text-white shadow-emerald-900/20' : 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/20'}`}
-                  >
-                    {manualSuccess ? <><Check size={16} /> Changes Synced!</> : <><Send size={16} /> Apply Changes Manually</>}
-                  </button>
+                <div className="p-6 bg-blue-500/10 border border-blue-500/20 rounded-[2.5rem]">
+                  <p className="text-[10px] text-blue-400 font-bold uppercase italic text-center leading-relaxed">
+                    Changes sync instantly via BroadcastChannel if dashboard is open in another tab!
+                  </p>
                 </div>
 
                 <div className="space-y-6">
@@ -728,9 +659,9 @@ const App = () => {
                         </span>
                         <button 
                           onClick={() => { navigator.clipboard.writeText(getLayoutLink(l)); alert(`Overlay Link Copied!`); }} 
-                          className="w-full flex items-center justify-center gap-2 py-3 bg-gray-800 hover:bg-blue-600 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
+                          className="w-full flex items-center justify-center gap-2 py-3 bg-gray-800 hover:bg-emerald-600 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
                         >
-                          <Wifi size={14} /> Copy OBS Overlay Link
+                          <Database size={14} /> Copy OBS Browser Source Link
                         </button>
                       </div>
                     ))}
@@ -820,7 +751,7 @@ const App = () => {
                 <div className="min-h-[600px] border-t border-gray-800/60 bg-[#020617] relative group overflow-hidden flex flex-col">
                   <div className="absolute top-6 left-6 z-10 flex items-center gap-4">
                     <div className="bg-black/80 backdrop-blur-xl border border-white/10 px-4 py-2 rounded-2xl flex items-center gap-3 shadow-2xl text-[10px] font-black uppercase tracking-widest text-white">
-                      <Eye size={14} className="text-blue-500" /> Live Preview
+                      <Eye size={14} className="text-blue-500" /> Real-time Preview
                     </div>
                     <div className="flex gap-2 p-1 bg-black/60 backdrop-blur-md rounded-xl border border-white/5 shadow-2xl">
                       {['row', 'stack', 'grid-2x3', 'grid-3x2'].map(l => (
@@ -839,7 +770,6 @@ const App = () => {
                         manifest={manifest} 
                         manifestAvatars={manifestAvatars}
                         scale={0.65} 
-                        forceAnchor={true}
                       />
                     </div>
                   </div>
